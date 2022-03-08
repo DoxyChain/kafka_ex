@@ -59,13 +59,18 @@ defmodule KafkaEx.GenConsumer do
 
   * `{:sync_commit, new_state}` causes synchronous offset commits.
   * `{:async_commit, new_state}` causes asynchronous offset commits.
-  * `{:no_commit, new_state, commited_offset}` causes manuall offset commits.
+  * `{:sync_commit, new_state, last_offset}` causes synchronous offset commits.
+  * `{:async_commit, new_state, last_offset}` causes asynchronous offset commits.
+  * `{:no_commit, new_state, committed_offset}` causes manual offset commits.
 
   Note that with first or second of the offset commit strategies, only if the
   final offset in the message set is committed and this is done after
   the messages are consumed. If you want to commit the offset of every message
   consumed, use the synchronous offset commit strategy and implement calls to
   `KafkaEx.offset_commit/2` within your consumer as appropriate.
+
+  Note that if returned `last_offset` does not equal to last message`s offset,
+  the consumer is terminated.
 
   ### Synchronous offset commits
 
@@ -277,6 +282,11 @@ defmodule KafkaEx.GenConsumer do
   used sparingly, since committing every message synchronously would impact a
   consumer's performance and could result in excessive network traffic.
 
+  Returning `{:sync_commit, new_state, last_offset}` and `{:async_commit, new_state, last_offset}`
+  commits `message` on `last_offset` and if `last_offset` is not equal to last message offset
+  from messages set then consumer terminates with error. This behaviour should be used
+  when there is a message which the consumer cannot properly handle.
+
   Returning `{:no_commit, new_state, commited_offset}` does not acknowledge the received `message`.
   The Kafka queue continues with the new state `new_state`. The messages must
   be confirmed manually, based on the offset received in the processed messages
@@ -285,6 +295,8 @@ defmodule KafkaEx.GenConsumer do
   @callback handle_message_set(message_set :: [Message.t()], state :: term) ::
               {:async_commit, new_state :: term}
               | {:sync_commit, new_state :: term}
+              | {:sync_commit, new_state :: term, last_offset :: integer()}
+              | {:async_commit, new_state :: term, last_offset :: integer()}
               | {:no_commit, new_state :: term, commited_offset :: integer()}
 
   @doc """
@@ -787,9 +799,19 @@ defmodule KafkaEx.GenConsumer do
             current_offset: commited_offset
         }
 
+      {sync_status, new_consumer_state, last_offset} ->
+        %Message{offset: last_msg_offset} = List.last(message_set)
+        state_out = %State{
+          state
+          | consumer_state: new_consumer_state,
+            acked_offset: last_offset + 1,
+            current_offset: last_offset + 1
+        }
+        handle_commit(sync_status, state_out)
+        |> handle_manual_offset(last_msg_offset, last_offset)
+
       {sync_status, new_consumer_state} ->
         %Message{offset: last_offset} = List.last(message_set)
-
         state_out = %State{
           state
           | consumer_state: new_consumer_state,
@@ -800,6 +822,9 @@ defmodule KafkaEx.GenConsumer do
         handle_commit(sync_status, state_out)
     end
   end
+
+  defp handle_manual_offset(state, offset, offset), do: state
+  defp handle_manual_offset(_state, _last_msg_offset, _last_offset), do: {:error, :unexpected_offset}
 
   defp handle_offset_out_of_range(
          %State{
